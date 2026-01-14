@@ -1,0 +1,30 @@
+# Ignore version control
+.git
+.gitignore
+
+# Ignore dependencies (installed in container)
+node_modules
+
+# Ignore build output (built in container)
+.next
+out
+
+# Ignore IDE files
+.vscode
+.idea
+*.swp
+*.swo
+
+# Ignore test output
+coverage
+
+# Ignore development files
+*.md
+!README.md
+.env
+.env.local
+.env.development
+.env.test
+
+# Ignore TypeScript build info
+tsconfig.tsbuildinfo

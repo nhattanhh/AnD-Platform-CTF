@@ -1,0 +1,566 @@
+import uuid
+from pathlib import Path
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core import get_db, get_settings, CannotDeleteRunningGameError, TeamNotFoundError
+from src.models import GameStatus
+from src.schemas import (
+    GameCreate,
+    GameUpdate,
+    GameTeamAdd,
+    GameTeamUpdate,
+    GameResponse,
+    GameTeamResponse,
+    GameListResponse,
+    DeleteResponse,
+)
+from src.services import game_service, docker_service
+from src.services import port_service
+
+router = APIRouter(prefix="/games", tags=["games"])
+
+
+@router.post("", response_model=GameResponse)
+async def create_game(
+    data: GameCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    existing = await game_service.get_game_by_name(db, data.name)
+    if existing:
+        raise HTTPException(status_code=400, detail="Game name already exists")
+    
+    game = await game_service.create_game(db, data)
+    return game
+
+
+@router.get("", response_model=GameListResponse)
+async def list_games(
+    skip: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+):
+    games = await game_service.list_games(db, skip, limit)
+    return GameListResponse(games=games, total=len(games))
+
+
+@router.get("/{game_id}", response_model=GameResponse)
+async def get_game(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    return game
+
+
+@router.patch("/{game_id}", response_model=GameResponse)
+async def update_game(
+    game_id: uuid.UUID,
+    data: GameUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status not in [GameStatus.DRAFT, GameStatus.PAUSED]:
+        raise HTTPException(status_code=400, detail="Cannot update game in current state")
+    
+    return await game_service.update_game(db, game, data)
+
+
+
+
+
+
+
+
+@router.post("/{game_id}/teams", response_model=GameTeamResponse)
+async def add_team(
+    game_id: uuid.UUID,
+    data: GameTeamAdd,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    # Only allow team changes in DRAFT status
+    if game.status != GameStatus.DRAFT:
+        raise HTTPException(
+            status_code=400, 
+            detail="Cannot add teams: game must be in draft status"
+        )
+    
+    game_team = await game_service.add_team_to_game(db, game_id, data.team_id)
+    return game_team
+
+
+@router.get("/{game_id}/teams", response_model=list[GameTeamResponse])
+async def get_game_teams(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    return await game_service.get_game_teams(db, game_id)
+
+
+@router.post("/{game_id}/start")
+async def start_game(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status not in [GameStatus.DRAFT, GameStatus.PAUSED]:
+        raise HTTPException(status_code=400, detail="Game cannot be started in current state")
+    
+    if not game.vulnbox_path:
+        raise HTTPException(status_code=400, detail="Vulnbox not uploaded")
+    
+    if not game.checker_module:
+        raise HTTPException(status_code=400, detail="Checker not uploaded")
+    
+    teams = await game_service.get_game_teams(db, game_id)
+    if not teams:
+        raise HTTPException(status_code=400, detail="No teams in game")
+    
+    # CRITICAL: Check if any team is already in another running game
+    for team in teams:
+        conflicting_games = await game_service.get_running_games_for_team(db, team.team_id)
+        conflicting = [g for g in conflicting_games if g.id != game_id]
+        if conflicting:
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Team {team.team_id} is already in running game: {conflicting[0].name}"
+            )
+    
+    await game_service.update_game_status(db, game, GameStatus.DEPLOYING)
+    
+    try:
+        image_tag = await docker_service.build_vulnbox_image(game_id, game.vulnbox_path)
+    except Exception as e:
+        await game_service.update_game_status(db, game, GameStatus.DRAFT)
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to build vulnbox image: {str(e)}. Please check Docker and try again."
+        )
+    
+    # Check for port conflicts with other running games
+    port_conflicts = await port_service.check_port_conflicts(db, game_id, len(teams))
+    if port_conflicts:
+        await game_service.update_game_status(db, game, GameStatus.DRAFT)
+        conflict_details = ", ".join(
+            f"port {c['port']} (used by game {c['used_by_game'][:8]}...)"
+            for c in port_conflicts[:3]
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Port conflict with running games: {conflict_details}. "
+                   f"Please stop conflicting games or wait for more ports to be available."
+        )
+    
+    settings = get_settings()
+    team_credentials = []
+    
+    for idx, team in enumerate(teams):
+        ssh_port = await port_service.get_port_for_team(db, game_id, idx)
+        ssh_username, ssh_password = docker_service.generate_ssh_credentials()
+        
+        try:
+            container_name, container_ip = await docker_service.deploy_team_container(
+                game_id, team.team_id, image_tag, ssh_port, ssh_username, ssh_password
+            )
+        except Exception as e:
+            # Cleanup already deployed containers
+            for cred in team_credentials:
+                try:
+                    await docker_service.stop_team_container(f"adg-{game_id}-{cred['team_id']}")
+                except Exception:
+                    pass
+            await game_service.update_game_status(db, game, GameStatus.DRAFT)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to deploy container for team {team.team_id}: {str(e)}"
+            )
+        
+        await game_service.update_game_team_container(
+            db, team, container_name, container_ip, ssh_username, ssh_password, ssh_port
+        )
+        
+        team_credentials.append({
+            "team_id": team.team_id,
+            "container_ip": container_ip,
+            "ssh_host": settings.ssh_host,
+            "ssh_port": ssh_port,
+            "ssh_username": ssh_username,
+            "ssh_password": ssh_password,
+        })
+    
+    await game_service.update_game_status(db, game, GameStatus.RUNNING)
+    
+    return {
+        "message": "Game started",
+        "teams_deployed": len(teams),
+        "teams": team_credentials,
+    }
+
+
+
+@router.post("/{game_id}/pause")
+async def pause_game(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status != GameStatus.RUNNING:
+        raise HTTPException(status_code=400, detail="Game is not running")
+    
+    await game_service.update_game_status(db, game, GameStatus.PAUSED)
+    return {"message": "Game paused"}
+
+
+@router.post("/{game_id}/stop")
+async def stop_game(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    teams = await game_service.get_game_teams(db, game_id)
+    for team in teams:
+        if team.container_name:
+            await docker_service.stop_team_container(team.container_name)
+    
+    await game_service.update_game_status(db, game, GameStatus.FINISHED)
+    return {"message": "Game stopped", "containers_removed": len(teams)}
+
+
+@router.post("/{game_id}/force-stop")
+async def force_stop_game(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Force stop a game (including DEPLOYING state). Cleans up containers and images, resets to DRAFT."""
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status == GameStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Game is already in draft state")
+    
+    if game.status == GameStatus.FINISHED:
+        raise HTTPException(status_code=400, detail="Game is already finished")
+    
+    # Stop all team containers
+    containers_stopped = 0
+    teams = await game_service.get_game_teams(db, game_id)
+    for team in teams:
+        if team.container_name:
+            try:
+                await docker_service.stop_team_container(team.container_name)
+                containers_stopped += 1
+            except Exception:
+                pass  # Continue even if container stop fails
+            
+            # Clear container info from team record
+            await game_service.update_game_team_container(
+                db, team, None, None, None, None, None
+            )
+    
+    # Remove the vulnbox image
+    image_removed = await docker_service.remove_vulnbox_image(game_id)
+    
+    # Reset game status to DRAFT so it can be reconfigured
+    await game_service.update_game_status(db, game, GameStatus.DRAFT)
+    
+    return {
+        "message": "Game force stopped and reset to draft",
+        "containers_stopped": containers_stopped,
+        "image_removed": image_removed,
+        "new_status": "draft",
+    }
+
+
+@router.delete("/{game_id}", response_model=DeleteResponse)
+async def delete_game(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status in [GameStatus.RUNNING, GameStatus.DEPLOYING]:
+        raise CannotDeleteRunningGameError().to_http_exception()
+    
+    teams = await game_service.get_game_teams(db, game_id)
+    for team in teams:
+        if team.container_name:
+            await docker_service.stop_team_container(team.container_name)
+    
+    await game_service.delete_game(db, game_id)
+    return DeleteResponse(deleted_id=game_id)
+
+
+@router.get("/{game_id}/teams/{team_id}", response_model=GameTeamResponse)
+async def get_game_team(
+    game_id: uuid.UUID,
+    team_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    game_team = await game_service.get_game_team(db, game_id, team_id)
+    if not game_team:
+        raise TeamNotFoundError().to_http_exception()
+    
+    return game_team
+
+
+
+
+
+@router.delete("/{game_id}/teams/{team_id}", response_model=DeleteResponse)
+async def remove_team(
+    game_id: uuid.UUID,
+    team_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    # Only allow team changes in DRAFT status
+    if game.status != GameStatus.DRAFT:
+        raise HTTPException(
+            status_code=400, 
+            detail="Cannot remove teams: game must be in draft status"
+        )
+    
+    game_team = await game_service.get_game_team(db, game_id, team_id)
+    if not game_team:
+        raise TeamNotFoundError().to_http_exception()
+    
+    if game_team.container_name:
+        await docker_service.stop_team_container(game_team.container_name)
+    
+    await game_service.delete_game_team(db, game_id, team_id)
+    return DeleteResponse(deleted_id=game_team.id)
+
+
+@router.post("/{game_id}/assign-vulnbox", response_model=GameResponse, deprecated=True)
+async def assign_vulnbox(
+    game_id: uuid.UUID,
+    vulnbox_id: uuid.UUID = Query(..., description="Vulnbox UUID to assign"),
+    db: AsyncSession = Depends(get_db),
+):
+    """DEPRECATED: Use POST /games/{game_id}/vulnboxes instead.
+    This endpoint only sets primary vulnbox, use /vulnboxes for multi-vulnbox support."""
+    from src.services import vulnbox_service
+    
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status != GameStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Can only assign vulnbox in draft state")
+    
+    vulnbox = await vulnbox_service.get_vulnbox(db, vulnbox_id)
+    if not vulnbox:
+        raise HTTPException(status_code=404, detail="Vulnbox not found")
+    
+    # Also add to junction table for consistency
+    await game_service.add_vulnbox_to_game(db, game_id, vulnbox)
+    
+    return await game_service.assign_vulnbox(db, game, vulnbox)
+
+
+# ==================== VULNBOXES (Many-to-Many) ====================
+
+@router.post("/{game_id}/vulnboxes")
+async def add_vulnbox(
+    game_id: uuid.UUID,
+    vulnbox_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Add a vulnbox to the game. Games can have multiple vulnboxes (services)."""
+    from src.services import vulnbox_service
+    
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status != GameStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Can only modify vulnboxes in draft state")
+    
+    vulnbox = await vulnbox_service.get_vulnbox(db, vulnbox_id)
+    if not vulnbox:
+        raise HTTPException(status_code=404, detail="Vulnbox not found")
+    
+    game_vulnbox = await game_service.add_vulnbox_to_game(db, game_id, vulnbox)
+    return {
+        "message": "Vulnbox added to game",
+        "id": str(game_vulnbox.id),
+        "game_id": str(game_id),
+        "vulnbox_id": str(vulnbox_id),
+    }
+
+
+@router.get("/{game_id}/vulnboxes")
+async def list_vulnboxes(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """List all vulnboxes assigned to a game."""
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    vulnboxes = await game_service.get_game_vulnboxes(db, game_id)
+    return {
+        "game_id": str(game_id),
+        "vulnboxes": [
+            {"id": str(gv.vulnbox_id), "vulnbox_path": gv.vulnbox_path}
+            for gv in vulnboxes
+        ],
+        "count": len(vulnboxes),
+    }
+
+
+@router.delete("/{game_id}/vulnboxes/{vulnbox_id}")
+async def remove_vulnbox(
+    game_id: uuid.UUID,
+    vulnbox_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove a vulnbox from the game."""
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status != GameStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Can only modify vulnboxes in draft state")
+    
+    success = await game_service.remove_vulnbox_from_game(db, game_id, vulnbox_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Vulnbox not assigned to this game")
+    
+    return {"message": "Vulnbox removed from game"}
+
+
+# ==================== CHECKER (One-to-One) ====================
+
+@router.put("/{game_id}/checker", response_model=GameResponse)
+async def set_checker(
+    game_id: uuid.UUID,
+    checker_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Set the checker for this game. Only one checker per game."""
+    from src.services import checker_crud_service
+    
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status != GameStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Can only set checker in draft state")
+    
+    checker = await checker_crud_service.get_checker(db, checker_id)
+    if not checker:
+        raise HTTPException(status_code=404, detail="Checker not found")
+    
+    return await game_service.assign_checker(db, game, checker)
+
+
+@router.get("/{game_id}/checker")
+async def get_checker(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the checker assigned to this game."""
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if not game.checker_id:
+        return {"game_id": str(game_id), "checker": None}
+    
+    return {
+        "game_id": str(game_id),
+        "checker": {
+            "id": str(game.checker_id),
+            "module": game.checker_module,
+        }
+    }
+
+
+@router.delete("/{game_id}/checker", response_model=GameResponse)
+async def remove_checker(
+    game_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove the checker from this game."""
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status != GameStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Can only modify checker in draft state")
+    
+    game.checker_id = None
+    game.checker_module = None
+    await db.commit()
+    await db.refresh(game)
+    return game
+
+
+@router.post("/{game_id}/assign-checker", response_model=GameResponse, deprecated=True)
+async def assign_checker(
+    game_id: uuid.UUID,
+    checker_id: uuid.UUID = Query(..., description="Checker UUID to assign"),
+    db: AsyncSession = Depends(get_db),
+):
+    """DEPRECATED: Use PUT /games/{game_id}/checker instead."""
+    from src.services import checker_crud_service
+    
+    game = await game_service.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    if game.status != GameStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Can only assign checker in draft state")
+    
+    checker = await checker_crud_service.get_checker(db, checker_id)
+    if not checker:
+        raise HTTPException(status_code=404, detail="Checker not found")
+    
+    return await game_service.assign_checker(db, game, checker)
+
+
+# ==================== PORT ALLOCATION (Admin/Debug) ====================
+
+@router.get("/admin/ports")
+async def get_port_allocation_status(
+    db: AsyncSession = Depends(get_db),
+):
+    """Get port allocation status across all active games.
+    
+    Useful for debugging port conflicts and monitoring resource usage.
+    """
+    return await port_service.get_available_ports_summary(db)

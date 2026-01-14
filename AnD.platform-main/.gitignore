@@ -1,0 +1,63 @@
+# Attack & Defense CTF Gameserver
+# =================================
+
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+/media
+/staticfiles
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Docker
+*.dockerignore
+
+# Logs
+logs/
+*.log
+
+# Compiled files
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Uploads and examples
+uploads/
+examples/

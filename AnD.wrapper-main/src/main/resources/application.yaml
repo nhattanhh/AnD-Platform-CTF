@@ -1,0 +1,48 @@
+spring:
+  application:
+    name: atk-def-wrapper
+  main:
+    allow-bean-definition-overriding: true
+  datasource:
+    url: jdbc:postgresql://localhost:5432/adg_core
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false  # Disable in production for performance
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        default_schema: public
+
+# JWT Configuration
+jwt:
+  # IMPORTANT: Set JWT_SECRET environment variable in production (min 32 chars)
+  secret: ${JWT_SECRET:mySecretKeyThatIsLongEnoughForJWT256BitsSecurityRequirements123456789}
+  expirationMs: 86400000  # 24 hours
+
+# CORS Configuration
+cors:
+  # Comma-separated list of allowed origins
+  allowed-origins: ${CORS_ORIGINS:http://localhost:3000,http://localhost:5173}
+  allow-credentials: true
+
+# Rate Limiting Configuration
+ratelimit:
+  enabled: true
+  requests-per-minute: 60  # Per IP address
+
+# Python Game Server Configuration
+python:
+  server-url: ${PYTHON_SERVER_URL:http://localhost:8000}
+
+# Logging Configuration
+logging:
+  level:
+    root: INFO
+    com.tool.atkdefbackend: INFO
+    com.tool.atkdefbackend.config.security: DEBUG
+    org.springframework.security: INFO
