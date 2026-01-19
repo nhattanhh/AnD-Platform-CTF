@@ -1,0 +1,14 @@
+# Platform
+docker compose up -d 
+sudo systemctl start postgresql
+source venv/bin/activate && python3 main.py
+
+# Wrapper 
+mvn spring-boot:run
+
+# Frontend 
+bun run dev
+
+------------
+
+sudo docker compose down -v
